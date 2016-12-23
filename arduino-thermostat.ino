@@ -1,7 +1,6 @@
 //this code is distributed under a creative commons license
 //written by thecheese429 - thecheese429@gmail.com
-#define version 1.103
-
+#define version 1.104
 
 
 //inputs		
@@ -11,38 +10,54 @@
 		
 //outputs		
 #define BACKLIGHTPIN 3		
-#define COMPRESSORPIN 11	
-#define FANPIN 13	
-#define HEATPIN 12
+#define COMPRESSORPIN 12	
+#define FANPIN 10
+#define HEATPIN 11
 		
 //circuit variables		
 #define TEMPRES1 1000				
 #define TEMPRES2 2000		
 #define THERMISTORSLOPE 1		//UPDATE
-		
-//HVAC variables
-#define COMPRESSORDELAY 1500		//millisecond delay between compressor shutoff and startup
-#define COOLTEMPRANGE 0.5			//temperature difference between turning on and turning off, during cooling mode
-#define HEATTEMPRANGE 0.1			//temperature difference between turning on and off, during heating mode
-#define FANSTARTDELAY 1000			//delay between compressor or furnace start and fan starting
-#define FANSTOPDELAY 4500			//delay between compressor or furnace shutting off and fan shutting off
-#define ROLLINGAVERAGECOUNT 100	//The number of past temperature values used to smooth the temperature
 
-#define DEFAULTHEAT 24
-#define DEFAULTCOOL 25
+
+#define ROLLINGAVERAGECOUNT 10	//The number of past temperature values used to smooth the temperature
+		
+//Heating variables
+#define MINHEATCYCLETIME 3000		//millisecond delay between compressor shutoff and startup
+#define HEATSTARTDELAY 0
+#define HEATSTOPDELAY 0
+#define HEATRESTARTDELAY 0
+#define HEATTEMPRANGE 1
+#define DEFAULTHEAT 20
+
+//Cooling variables
+#define MINCOMPRESSORCYCLETIME 0
+#define COMPRESSORSTARTDELAY 0
+#define COMPRESSORSTOPDELAY 0
+#define COOLRESTARTDELAY 10000
+#define COOLTEMPRANGE 2	//temperature difference between turning on and turning off, during cooling mode
+#define DEFAULTCOOL 30
+
+//Fan variables
+#define MINFANCYCLETIME 0
+#define FANSTARTDELAY 0
+#define FANSTOPDELAY 0
+#define FANRESTARTDELAY 0
+
 
 //interface variables
 #define LIGHTTIMEOUT 4000
-#define RAMPTIME 400
+#define RAMPTIME 1000
 #define PROXIMITYBRIGHTNESS 60		//the brightness of the LCD screen when it illuminates for proximity
-#define CYCLEDELAY 200
+#define CYCLEDELAY 100
 #define PROXIMITYTHRESHHOLD 100			//the threshhold for registering an object near proximity sensor
+#define PROXIMITYROLLINGAVERAGE 5		//the number of samples used to determine the proximity of viewer
 
 /*++++++++++++++++++++++++++++++++++++++++++++++
 	
-	NO VARIABLES BELOW THIS LINE
+		NO VARIABLES BELOW THIS LINE
 	
-*/	
+++++++++++++++++++++++++++++++++++++++++++++++*/	
 
 #include <FastIO.h>
 #include <I2CIO.h>
@@ -53,6 +68,7 @@
 #include <TimeLib.h>
 #include <BitBool.h>
 #include <OnewireKeypad.h>
+//#include <Average.h>
 
 
 //miscellaneous
@@ -61,13 +77,29 @@
 double currTemp = 0;
 unsigned long currTime;
 unsigned long buttonTime = 0;
-byte mode = 0;		// The mode determines if the heat or cool is regulated, or if the fan should stay on. 
+unsigned long lastCycle = 0;
+byte runMode = 0;		// see notes below 
 byte state = 0;		// The state contains the active on and off states of the outputs, based on temperature and mode. - | - | - | - | - | cool | heat | fan
+byte settings;
 double heatTarget = DEFAULTHEAT;
 double coolTarget = DEFAULTCOOL;
 
 
-LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);  // Set the LCD I2C address and pin mapping
+
+
+/*
+
+The modes are as follow:
+
+0 - off
+1 - fan only
+2 - cooling only 
+3 - heating only 
+4 - automatically heat or cool 
+
+*/
+
+
 
 class Output 
 {
@@ -79,14 +111,18 @@ class Output
 		unsigned long lastCalledInactive = 0;
 		unsigned long activationDelay;
 		unsigned long deactivationDelay;
+		unsigned long restartDelay;
+		unsigned long minimumCycle;
 		boolean isActive = 0;
 		boolean isCalledActive = 0;
 		boolean isCalledInactive = 0;
 		byte pin;
 		
-	Output(unsigned long activationDelay, unsigned long deactivationDelay, byte pin)
+	Output(unsigned long activationDelay, unsigned long deactivationDelay, unsigned long restartDelay, unsigned long minimumCycle, byte pin)
 	{
 		this->currTime = currTime;
+		this->restartDelay = restartDelay;
+		this->minimumCycle = minimumCycle;
 		this->pin = pin;
 		this->activationDelay = activationDelay;
 		this->deactivationDelay = deactivationDelay;
@@ -97,28 +133,22 @@ class Output
 	{
 		this->currTime = currTime;
 		
-		if(isActive == 1)
+		if(callState)
 		{
-			if(callState == 0)
+			if(isCalledActive == 0)
 			{
-				if(isCalledInactive == 0)
-				{
-					lastCalledInactive = currTime;
-					isCalledInactive = 1;
-					Serial << "setState calling pin " << pin << " to Inactive\n";
-				}
+				isCalledActive = 1;
+				isCalledInactive = 0;
+				lastCalledActive = currTime;
 			}
 		}
 		else
 		{
-			if(callState == 1)
+			if(isCalledInactive == 0)
 			{
-				if(isCalledActive == 0)
-				{
-					lastCalledActive = currTime;
-					isCalledActive = 1;
-					Serial << "setState calling pin " << pin << " to Active\n";
-				}
+				isCalledInactive = 1;
+				isCalledActive = 0;
+				lastCalledInactive = currTime;
 			}
 		}
 	}
@@ -127,32 +157,36 @@ class Output
 	{
 		this->currTime = currTime;
 		
-		if(isCalledActive == 1)
+		if(isActive == 0)
 		{
-			if(isActive == 0)
+			if(isCalledActive == 1)
 			{
-				if(currTime - lastCalledActive > activationDelay)
+				if( currTime - lastDeactivated > restartDelay )
 				{
-					isCalledActive = 0;
-					isActive = 1;
-					lastActivated = currTime;
-					digitalWrite(pin, isActive);
+					if(currTime - lastCalledActive > activationDelay )
+					{
+						isActive = 1;
+						isCalledActive = 0;
+						lastActivated = currTime;
+						digitalWrite(pin, isActive);
+					}
 					
-					Serial << "Class Output setting pin " << pin << " to " << isActive << "\n";
 				}
 			}
 		}
-		else if(isCalledInactive)
+		else
 		{
-			if(isActive == 1)
+			if(isCalledInactive == 1)
 			{
-				if(currTime - lastCalledInactive > deactivationDelay)
+				if( currTime - lastActivated > minimumCycle )
 				{
-					isCalledInactive = 0;
-					isActive = 0;
-					lastDeactivated = currTime;
-					digitalWrite(pin, isActive);
-					Serial << "Class Output setting pin " << pin << " to " << isActive << "\n";
+					if( currTime - lastCalledInactive > deactivationDelay )
+					{
+						isActive = 0;
+						isCalledInactive = 0;
+						lastDeactivated = currTime;
+						digitalWrite(pin, isActive);
+					}
 				}
 			}
 		}
@@ -162,30 +196,52 @@ class Output
 class Input
 {
 	private:
+		double sumValue = 0;
+		int history[];
+	
+	public:
+		double avgValue = 0;
+		double modeValue = 0;
 		int smoothing;
 		byte pin;
 	
-	public:
-		double value;
-	
 	Input(int smoothing, byte pin)
 	{
+		//delay(1000);
 		this->smoothing = smoothing;
 		this->pin = pin;
-		value = 0;
+		// int history[smoothing];
+		sumValue = 0;
 		pinMode(pin, INPUT);
-		for(int x = 0; x < 10; x++)
-		{
-			value += analogRead(pin);
-		}
-		value /= 10;
+		// Serial << "Initializing history array of length " << smoothing << "\n";
+		// for(int x = 0; x < smoothing; x++)
+		// {
+			// history[x] = analogRead(pin);
+			// sumValue +=history[x];
+			// Serial << "Value " << history[x] << " is in slot " << x << "\n";
+		// }
+		// avgValue = sumValue / smoothing;
+		// modeValue = mode(history,smoothing);
+		
+		avgValue = analogRead(pin);
 	}
 	
 	void update()
 	{
-		value *= (smoothing - 1);
-		value += analogRead(pin);
-		value /= smoothing;
+		// sumValue = 0;
+		// for(int x = 0; x < smoothing - 1; x++ )
+		// {
+			// history[x] = history [x + 1];
+			// sumValue += history[x];
+			// Serial << history[x] << " | ";
+			// if( x == (smoothing - 1) )
+				// Serial << " . \n";
+		// }
+		// history[smoothing] = analogRead(pin);
+		
+		// avgValue = sumValue / smoothing;
+		//modeValue = mode(history,smoothing);
+		avgValue = analogRead(pin);
 	}
 };
 		
@@ -243,21 +299,23 @@ class Backlight
 	}		
 };	
 	
-Output compressor(COMPRESSORDELAY, 0, COMPRESSORPIN);
-Output heater(0,0, HEATPIN);
-Output fan(FANSTARTDELAY, FANSTOPDELAY, FANPIN);
+Output compressor(COMPRESSORSTARTDELAY, COMPRESSORSTOPDELAY, COOLRESTARTDELAY, MINCOMPRESSORCYCLETIME, COMPRESSORPIN);
+Output heater(HEATSTARTDELAY, HEATSTOPDELAY, HEATRESTARTDELAY, MINHEATCYCLETIME, HEATPIN);
+Output fan(FANSTARTDELAY, FANSTOPDELAY, FANRESTARTDELAY, MINFANCYCLETIME, FANPIN);
 
-Input temperature(100, TEMPSENSE);
-Input proximity(5, PROXIMITYSENSE);
+Input temperature(ROLLINGAVERAGECOUNT, TEMPSENSE);
+Input proximity(PROXIMITYROLLINGAVERAGE, PROXIMITYSENSE);
 
 Backlight backlight(BACKLIGHTPIN, RAMPTIME);	
+
+LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);  // Set the LCD I2C address and pin mapping
 
 void setup()
 {
 	
 	
 
-	mode = B00000101;
+	runMode = 4;
 	
 	lcd.begin(16,4);
 	Serial.begin(9600);
@@ -290,7 +348,7 @@ void setBacklight(unsigned long currTime)
 	{
 		backlight.setTarget(currTime, 255);
 	}
-	else if( proximity.value > PROXIMITYTHRESHHOLD )
+	else if( proximity.avgValue > PROXIMITYTHRESHHOLD )
 	{
 		backlight.setTarget(currTime, PROXIMITYBRIGHTNESS);		
 	}
@@ -300,43 +358,31 @@ void setBacklight(unsigned long currTime)
 	}
 }
 
-void determineState(double temperature)
+void determineState( double temperature )
 {
 	
-	if( mode == B00000000 )	//system is off
+	if( runMode == 0 )
 	{
-		state = mode;
+		state = B00000000;
 	}
-	else if( mode & B00000110 == B00000110 )	//system is AUTO
+	else if( runMode == 1 )
 	{
-		if(temperature > coolTarget + COOLTEMPRANGE)	//Temp is warm emough to start cooling
+		state = B00000001;
+	}
+	else if( runMode == 2 ) 
+	{
+		if( temperature - COOLTEMPRANGE > coolTarget )
 		{
 			state = B00000101;
 		}
-		else if( temperature < heatTarget + HEATTEMPRANGE)
-		{
-			state = B00000011;
-		}
-		else if(temperature > heatTarget && temperature < coolTarget)
+		else if( temperature < coolTarget )
 		{
 			state = B00000000;
 		}
 	}
-	else if( mode & B00000110 == B00000100 )	//system is set to cool only
+	else if ( runMode == 3 )
 	{
-		if(temperature > coolTarget + COOLTEMPRANGE)	//Temp is warm emough to start cooling
-		{
-			state = B00000101;
-		}		
-		else if(temperature < coolTarget )
-		{
-			state = B00000000;
-		}
-		
-	}
-	else if(mode & B00000110 == B00000010 ) //set to heat only
-	{
-		if(temperature < heatTarget - HEATTEMPRANGE )
+		if( temperature + HEATTEMPRANGE < heatTarget )
 		{
 			state = B00000011;
 		}
@@ -345,87 +391,26 @@ void determineState(double temperature)
 			state = B00000000;
 		}
 	}
-	
-	
-	if( mode & B00000001 == B00000001 ) //fan is on constant
+	else if( runMode == 4 )
 	{
-		state = state | B00000001;
-	}
-	
-	
-	/*if(mode & B00000111 == B00000001)	//mode is set to fan on constantly, no heat or cool.
-	{
-		if(state != B00000001)
-			Serial << "determineState set state to B00000001 from fan only\n";
-		state = B00000001;	//turn on the fan only
-		
-	}
-	else if(state == B00000000)
-	{
-		if(state != B00000000)
-			Serial << "determineState set state to B00000000 from fan only\n";
-		state = B00000000;
-	}
-	
-	if(mode & B0000110 == B00000110)	//mode is set to heat and cool automatically
-	{
-		if(temperature < heatTarget - HEATTEMPRANGE)
+		if( temperature + HEATTEMPRANGE < heatTarget )
 		{
-			if(state != B00000101)
-				Serial << "determineState set state to B00000101 by auto\n";
-			state = B00000101;	//turn on the fan and compressor
-			
+			state = B00000011;
 		}
-		else if(temperature > coolTarget + COOLTEMPRANGE)
+		else if( temperature - COOLTEMPRANGE > coolTarget )
 		{
-			if(state != B00000011)
-				Serial << "determineState set state to B00000011 by auto\n";
-			state = B00000011;	//turn on the fan and heat
+			state = B00000101;
 		}
-		else if(temperature > heatTarget && temperature < coolTarget) 	//if the temperature is within range
+		else if( temperature > heatTarget && temperature < coolTarget )
 		{
-			if(state != B00000000)
-				Serial << "determineState set state to B00000000 from auto\n";
-			state = B00000000;		//turn the outputs off
+			state = B00000000;
 		}
 	}
-	if(mode & B00000110 == B00000010 )	//mode is set to heat only
-	{
-		if(temperature > coolTarget + COOLTEMPRANGE)
-		{
-			if(state != B0000011)
-				Serial << "determineState set state to B00000011 for heating only \n";
-			state = B00000011;		//turn on the fan and heat
-		} 
-		else if(temperature < coolTarget) //if the temperature has dropped below the cooling target
-		{
-			if(state != B00000000)
-				Serial << "determineState set state to B00000000 from heating only\n";
-			state = B00000000;		//turn everything off
-		}
-	}
-	if(mode & B0000110 == B0000100 )	//mode is set to cool only
-	{
-		if(temperature < heatTarget - HEATTEMPRANGE)	//the temperature is below the heat target by at least the maximum delta
-		{
-			
-			if(state != B00000101)
-				Serial << "determineState set state to B00000101 for cool only\n";
-			state = B00000101;		//turn on the heat and fan
-		}
-		else if( temperature > heatTarget)	//if the heat is above the target
-		{
-			if(state != B00000000)
-				Serial << "determineState set state to B00000000 from cool only\n";
-			state = B00000000;		//turn everything off
-		}
-	}*/
-		
 }
 
-void setState(unsigned long currTime)
+void setOutputs(unsigned long currTime)
 {
-	if( state & B00000001 > 0)
+	if( (state & B00000001) == B00000001 )
 	{
 		fan.setState(currTime, 1);
 	}
@@ -434,7 +419,7 @@ void setState(unsigned long currTime)
 		fan.setState(currTime, 0);
 	}
 	
-	if( state & B00000100 > 0)
+	if( (state & B00000100) == B00000100 )
 	{
 		compressor.setState(currTime, 1);
 	}
@@ -443,7 +428,7 @@ void setState(unsigned long currTime)
 		compressor.setState(currTime, 0);
 	}
 	
-	if(state & B00000010 > 0)
+	if( (state & B00000010) == B00000010 )
 	{
 		heater.setState(currTime, 1);
 	}
@@ -454,36 +439,47 @@ void setState(unsigned long currTime)
 	
 }
 
-void loop()
+void display()
 {
-	currTime = millis();
-	
-	compressor.update(currTime);
-	heater.update(currTime);
-	fan.update(currTime);
-	
-	temperature.update();
-	proximity.update();
-	
-	backlight.update(currTime);
-	
-	currTemp = temperature.value * TEMPCONVERSION;
-	
-	setBacklight(currTime);
-	determineState(currTemp);
-	setState(currTime);
-	
 	lcd.home();
-	lcd << "Temp = " << temperature.value << "  ";
+	lcd << "mode T= " << temperature.modeValue << "  ";
 	lcd.setCursor(0,1);
-	lcd << "Prox = " << proximity.value << "  ";
+	lcd << "Avg  T= " << temperature.avgValue << "  ";
 	lcd.setCursor(0,2);
 	lcd << "mode = ";
-	lcd.print(mode, BIN);
+	lcd.print(runMode);
 	lcd << "        ";
 	lcd.setCursor(0,3);
 	lcd << "state= ";
 	lcd.print(state, BIN);
 	lcd << "        ";
+}
+
+void loop()
+{
+	currTime = millis();
+	
+	if(currTime - lastCycle > CYCLEDELAY)
+	{
+		lastCycle = currTime;
+		currTemp = temperature.avgValue * TEMPCONVERSION;
+		
+		compressor.update(currTime);
+		heater.update(currTime);
+		fan.update(currTime);
+		
+		temperature.update();
+		//proximity.update();
+		determineState( currTemp );
+			
+		display();
+		
+	}
+	
+	setOutputs(currTime);	
+	setBacklight( currTime );
+	backlight.update(currTime);
+
+	
 	
 }
