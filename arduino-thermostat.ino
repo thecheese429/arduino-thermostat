@@ -1,18 +1,18 @@
 //this code is distributed under a creative commons license
 //written by thecheese429 - thecheese429@gmail.com
-#define version 1.104
+#define version 1.105
 
 
 //inputs		
-#define TEMPSENSE A0
-#define PROXIMITYSENSE A1
+#define TEMPSENSE A6
+#define PROXIMITYSENSE A7
 #define KEYPAD	A2
 		
 //outputs		
-#define BACKLIGHTPIN 3		
-#define COMPRESSORPIN 12	
-#define FANPIN 10
-#define HEATPIN 11
+#define BACKLIGHTPIN 11		
+#define COMPRESSORPIN A1	
+#define FANPIN A3
+#define HEATPIN A2
 		
 //circuit variables		
 #define TEMPRES1 1000				
@@ -41,12 +41,12 @@
 //Fan variables
 #define MINFANCYCLETIME 0
 #define FANSTARTDELAY 0
-#define FANSTOPDELAY 0
+#define FANSTOPDELAY 3000
 #define FANRESTARTDELAY 0
 
 
 //interface variables
-#define LIGHTTIMEOUT 4000
+#define LIGHTTIMEOUT 6000
 #define RAMPTIME 1000
 #define PROXIMITYBRIGHTNESS 60		//the brightness of the LCD screen when it illuminates for proximity
 #define CYCLEDELAY 100
@@ -67,8 +67,12 @@
 #include <Time.h>
 #include <TimeLib.h>
 #include <BitBool.h>
-#include <OnewireKeypad.h>
-//#include <Average.h>
+#include <avr/pgmspace.h>
+#include <Keypad.h>
+#include <PrintEx.h>
+
+
+// template<class T> inline Print &operator <<(Print &obj, T arg) { obj.print(arg); return obj; } 
 
 
 //miscellaneous
@@ -81,10 +85,43 @@ unsigned long lastCycle = 0;
 byte runMode = 0;		// see notes below 
 byte state = 0;		// The state contains the active on and off states of the outputs, based on temperature and mode. - | - | - | - | - | cool | heat | fan
 byte settings;
+double menu = 0;
 double heatTarget = DEFAULTHEAT;
 double coolTarget = DEFAULTCOOL;
 
+const char *message[4][5]  = 
+{
+	{"status          ", "                ", "                " },
+	{"state           ", "Set cooling     ", "Set heating     " },
+	{"Current   Target", "target          ", "target          " },
+	{""                , ""                , ""                 }
+};
 
+const byte ROWS = 4; //four rows
+const byte COLS = 3; //three columns
+char keys[ROWS][COLS] = {
+{'1','2','3'},
+{'4','5','6'},
+{'7','8','9'},
+{'*','0','#'}
+};
+byte rowPins[ROWS] = {3, 4, 5, 6}; //connect to the row pinouts of the kpd
+byte colPins[COLS] = {7, 8, 9}; //connect to the column pinouts of the kpd
+
+unsigned long loopCount;
+unsigned long startTime;
+String msg;
+
+byte degC[8] = {	  
+  0b11100,
+  0b10100,
+  0b11100,
+  0b00000,
+  0b00110,
+  0b01000,
+  0b01000,
+  0b00110
+  };
 
 
 /*
@@ -98,6 +135,7 @@ The modes are as follow:
 4 - automatically heat or cool 
 
 */
+
 
 
 
@@ -241,7 +279,7 @@ class Input
 		
 		// avgValue = sumValue / smoothing;
 		//modeValue = mode(history,smoothing);
-		avgValue = analogRead(pin);
+		avgValue = ( (smoothing-1)*avgValue + analogRead(pin) ) / smoothing;
 	}
 };
 		
@@ -306,18 +344,21 @@ Output fan(FANSTARTDELAY, FANSTOPDELAY, FANRESTARTDELAY, MINFANCYCLETIME, FANPIN
 Input temperature(ROLLINGAVERAGECOUNT, TEMPSENSE);
 Input proximity(PROXIMITYROLLINGAVERAGE, PROXIMITYSENSE);
 
-Backlight backlight(BACKLIGHTPIN, RAMPTIME);	
-
+Backlight backlight(BACKLIGHTPIN, RAMPTIME);
 LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);  // Set the LCD I2C address and pin mapping
+Keypad kpd = Keypad( makeKeymap(keys), rowPins, colPins, ROWS, COLS );
 
 void setup()
 {
 	
 	
-
+	
+	msg = "";
 	runMode = 4;
 	
 	lcd.begin(16,4);
+	lcd.createChar(0, degC);
+	
 	Serial.begin(9600);
 	while(!Serial);
 	
@@ -441,23 +482,98 @@ void setOutputs(unsigned long currTime)
 
 void display()
 {
-	lcd.home();
-	lcd << "mode T= " << temperature.modeValue << "  ";
-	lcd.setCursor(0,1);
-	lcd << "Avg  T= " << temperature.avgValue << "  ";
-	lcd.setCursor(0,2);
-	lcd << "mode = ";
-	lcd.print(runMode);
-	lcd << "        ";
-	lcd.setCursor(0,3);
-	lcd << "state= ";
-	lcd.print(state, BIN);
-	lcd << "        ";
+	double a = 4561.123456789;
+	char number1[6], number2[6];
+	for(int y = 0; y<4; y++)
+	{
+		lcd.setCursor(0,y);
+		lcd.print(message[y][int(menu)]);
+		
+	}
+	if(true)
+	{
+		char numbers[17] = "||||old||data|||";
+		
+		sprintf( numbers, "%7.1f  %7.1f%s", temperature.avgValue, heatTarget, byte(0) );
+		lcd.setCursor(0,3);
+		lcd << numbers;
+		
+
+	}
+		
+	
+}
+
+void readKeys()
+{
+	if(kpd.getKeys())
+    {
+		buttonTime = currTime;
+        
+		for (int i=0; i<LIST_MAX; i++)   // Scan the whole key list.
+        {
+            if ( kpd.key[i].stateChanged )   // Only find keys that have changed state.
+            {
+				if( kpd.key[i].kstate == PRESSED )
+				{
+					char key = kpd.key[i].kchar;
+					Serial << key;
+					switch(key)
+					{
+						case '4':
+						if(menu == 2)
+						{
+							menu = 0;
+						}
+						else
+						{
+							menu++;
+						}
+						break;
+						
+						case '6':
+						if(menu == 0)
+						{
+							menu = 2;
+						}
+						else
+						{
+							menu--;
+						}
+						
+						case '8':
+						if(menu == 1)
+						{
+							coolTarget += 0.1;
+						}
+						if(menu == 2)
+						{
+							heatTarget += 0.1;
+						}
+						break;
+						
+						case '2':
+						if(menu == 1)
+						{
+							coolTarget -= 0.1;
+						}
+						if(menu == 2)
+						{
+							heatTarget -= 0.1;
+						}
+						break;
+					}
+				}
+            }
+		}
+    }
 }
 
 void loop()
 {
 	currTime = millis();
+	
+	
 	
 	if(currTime - lastCycle > CYCLEDELAY)
 	{
@@ -472,13 +588,18 @@ void loop()
 		//proximity.update();
 		determineState( currTemp );
 			
-		display();
-		
+		setOutputs(currTime);	
 	}
 	
-	setOutputs(currTime);	
+	
+	
 	setBacklight( currTime );
 	backlight.update(currTime);
+	readKeys();
+	display();
+	
+	
+	
 
 	
 	
